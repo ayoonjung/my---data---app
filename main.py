@@ -18,40 +18,35 @@ from zoneinfo import ZoneInfo
 # ------------------------------------------------------------
 # 기본 설정
 # ------------------------------------------------------------
-st.set_page_config(page_title="어제의 박스오피스", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="박스오피스 조회", page_icon="🎬", layout="wide")
 
 KOBIS_URL = "https://www.kobis.or.kr/kobisopenapi/webservice/rest/boxoffice/searchDailyBoxOfficeList.json"
 
 # 숫자로 바꿔야 하는 컬럼들 (API에서는 전부 문자열로 옴)
-NUMERIC_COLS = ["rank", "audiCnt", "audiAcc", "scrnCnt", "showCnt"]
+# rankInten: 전날 대비 순위 증감 (양수=순위 상승, 음수=순위 하락, 0=변동 없음)
+NUMERIC_COLS = ["rank", "rankInten", "audiCnt", "audiAcc", "scrnCnt", "showCnt"]
 
-# 화면에 보여줄 이름표
-DISPLAY_NAMES = {
-    "rank": "순위",
-    "movieNm": "영화명",
-    "openDt": "개봉일",
-    "audiCnt": "관객수",
-    "audiAcc": "누적관객",
-    "scrnCnt": "스크린수",
-}
+# 누적관객이 이 숫자를 넘으면 영화명 옆에 트로피를 붙입니다.
+MILLION = 1_000_000
 
 
-def get_yesterday_kst() -> str:
-    """
-    한국 시간(KST) 기준으로 '어제' 날짜를 yyyymmdd 형태의 문자열로 계산합니다.
-    배포 서버의 시계는 한국 시간이 아닐 수 있으므로, 항상 한국 시간대(Asia/Seoul)를
-    기준으로 직접 계산합니다.
-    """
-    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
-    yesterday_kst = now_kst - timedelta(days=1)
-    return yesterday_kst.strftime("%Y%m%d")
+def get_today_kst() -> datetime:
+    """한국 시간(KST) 기준 '오늘' datetime을 돌려줍니다."""
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+
+def to_yyyymmdd(d) -> str:
+    """date 객체를 KOBIS API가 요구하는 yyyymmdd 문자열로 바꿉니다."""
+    return d.strftime("%Y%m%d")
 
 
 @st.cache_data(ttl=3600)  # 같은 날짜는 1시간 동안 다시 API를 호출하지 않고 기억(캐시)합니다.
 def fetch_box_office(target_dt: str, api_key: str):
     """
     KOBIS API에서 일별 박스오피스 목록을 가져옵니다.
-    성공하면 (True, 영화 목록 리스트)를, 실패하면 (False, 오류 메시지)를 돌려줍니다.
+    성공하면 (True, 영화 목록 리스트)를,
+    아직 집계 전(빈 목록)이면 (False, "EMPTY")를,
+    그 외 실패면 (False, 안내 메시지)를 돌려줍니다.
     """
     params = {"key": api_key, "targetDt": target_dt}
 
@@ -80,7 +75,8 @@ def fetch_box_office(target_dt: str, api_key: str):
 
     movie_list = box_office_result.get("dailyBoxOfficeList")
     if not movie_list:
-        return False, "해당 날짜의 박스오피스 목록이 비어 있습니다. 조회 날짜가 아직 집계 전이거나 공휴일 등의 이유일 수 있습니다."
+        # 목록이 비어 있는 경우 = 아직 그 날짜 집계가 나오지 않은 경우
+        return False, "EMPTY"
 
     return True, movie_list
 
@@ -102,14 +98,44 @@ def to_dataframe(movie_list):
     return df
 
 
+def rank_change_badge(rank_inten: int) -> str:
+    """rankInten(전날 대비 순위 증감) 값을 색깔 있는 화살표 HTML로 바꿔 줍니다.
+    양수(순위 상승) -> 빨간 위 화살표, 음수(순위 하락) -> 파란 아래 화살표,
+    0(변동 없음) -> 표시 없음."""
+    if rank_inten > 0:
+        return f"<span style='color:red;font-weight:bold;'>▲ {rank_inten}</span>"
+    elif rank_inten < 0:
+        return f"<span style='color:blue;font-weight:bold;'>▼ {abs(rank_inten)}</span>"
+    else:
+        return "-"
+
+
+def movie_name_with_trophy(row) -> str:
+    """누적관객이 100만 명을 넘으면 영화명 옆에 트로피 이모지를 붙입니다."""
+    name = row["movieNm"]
+    if row["audiAcc"] >= MILLION:
+        return f"{name} 🏆"
+    return name
+
+
 # ------------------------------------------------------------
 # 화면 구성
 # ------------------------------------------------------------
-st.title("🎬 어제의 박스오피스")
+st.title("🎬 박스오피스 조회")
 
-target_dt = get_yesterday_kst()
-pretty_date = f"{target_dt[:4]}년 {target_dt[4:6]}월 {target_dt[6:]}일"
-st.caption(f"기준 날짜(한국 시간 기준 어제): {pretty_date}")
+today_kst = get_today_kst()
+# 오늘 건 아직 집계 전이므로, 고를 수 있는 가장 늦은 날짜는 '어제'까지입니다.
+max_date = (today_kst - timedelta(days=1)).date()
+
+selected_date = st.date_input(
+    "조회할 날짜를 선택하세요 (한국 시간 기준)",
+    value=max_date,      # 기본값은 어제
+    max_value=max_date,  # 오늘/미래는 선택 불가
+)
+
+target_dt = to_yyyymmdd(selected_date)
+pretty_date = selected_date.strftime("%Y년 %m월 %d일")
+st.caption(f"선택한 날짜: {pretty_date}")
 
 # secrets에서 인증키 불러오기
 if "KOBIS_KEY" not in st.secrets:
@@ -124,8 +150,11 @@ api_key = st.secrets["KOBIS_KEY"]
 success, result = fetch_box_office(target_dt, api_key)
 
 if not success:
-    # result에는 사용자에게 보여줄 안내 메시지가 들어있습니다.
-    st.warning(result)
+    if result == "EMPTY":
+        st.info(f"{pretty_date}은(는) 아직 집계 전입니다.")
+    else:
+        # result에는 사용자에게 보여줄 안내 메시지가 들어있습니다.
+        st.warning(result)
     st.stop()
 
 df = to_dataframe(result)
@@ -134,10 +163,11 @@ df = to_dataframe(result)
 # 1위 영화 - 지표 카드 3장
 # ------------------------------------------------------------
 top1 = df.iloc[0]
-st.subheader(f"🥇 1위: {top1['movieNm']}")
+top1_title = movie_name_with_trophy(top1)
+st.subheader(f"🥇 1위: {top1_title}")
 
 col1, col2, col3 = st.columns(3)
-col1.metric("어제 관객수", f"{int(top1['audiCnt']):,} 명")
+col1.metric("그날 관객수", f"{int(top1['audiCnt']):,} 명")
 col2.metric("누적 관객수", f"{int(top1['audiAcc']):,} 명")
 col3.metric("스크린수", f"{int(top1['scrnCnt']):,} 개")
 
@@ -156,5 +186,19 @@ st.divider()
 # 전체 표
 # ------------------------------------------------------------
 st.subheader("📋 전체 순위표")
-table_df = df[list(DISPLAY_NAMES.keys())].rename(columns=DISPLAY_NAMES)
-st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+table_df = pd.DataFrame({
+    "순위": df["rank"].astype(int),
+    "전일대비": df["rankInten"].astype(int).apply(rank_change_badge),
+    "영화명": df.apply(movie_name_with_trophy, axis=1),
+    "개봉일": df["openDt"],
+    "관객수": df["audiCnt"].astype(int).map("{:,}".format),
+    "누적관객": df["audiAcc"].astype(int).map("{:,}".format),
+    "스크린수": df["scrnCnt"].astype(int).map("{:,}".format),
+})
+
+# 화살표에 색을 입혀야 하므로 st.dataframe 대신 HTML 표로 렌더링합니다.
+st.markdown(
+    table_df.to_html(escape=False, index=False),
+    unsafe_allow_html=True,
+)
